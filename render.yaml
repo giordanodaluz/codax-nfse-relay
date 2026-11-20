@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: codax-nfse-relay
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /saude
+    envVars:
+      - key: CODAX_APP_URL
+        sync: false
+      - key: CODAX_RELAY_KEY
+        sync: false
+      - key: CODAX_CERTIFICATE_ENCRYPTION_KEY
+        sync: false
+      - key: NFSE_AMBIENTE
+        value: homologacao
