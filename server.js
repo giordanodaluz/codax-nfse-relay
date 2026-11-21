@@ -211,10 +211,55 @@ async function emitir(draftId) {
       number,
       accessKey: parsed.chaveAcesso || "",
     });
+    await baixarDanfse(draftId).catch((e) => console.error("DANFSe:", e.message));
     return { ok: true, number, chaveAcesso: parsed.chaveAcesso || null };
   }
   await reportResult(draftId, { status: "rejected", message: res.body.slice(0, 500) });
   return { ok: false, status: res.status, body: res.body.slice(0, 500) };
+}
+
+// --- DANFSe: PDF oficial da nota, baixado do ADN com o certificado (mTLS) ---
+const ADN_BASE = {
+  homologacao: "https://adn.producaorestrita.nfse.gov.br",
+  producao: "https://adn.nfse.gov.br",
+}[AMBIENTE];
+
+function getWithCert(urlStr, pfxBase64, password) {
+  const agent = new https.Agent({ pfx: Buffer.from(pfxBase64, "base64"), passphrase: password });
+  const url = new URL(urlStr);
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      { hostname: url.hostname, path: url.pathname, method: "GET", agent, headers: { accept: "application/pdf" }, timeout: 60000 },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(chunks) }));
+      },
+    );
+    req.on("timeout", () => req.destroy(new Error("Tempo esgotado ao baixar o DANFSe.")));
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+async function baixarDanfse(draftId) {
+  const res = await fetch(`${APP_URL}/api/public/nfse/relay?draftId=${encodeURIComponent(draftId)}&purpose=danfse`, {
+    headers: { "x-relay-key": RELAY_KEY },
+  });
+  const info = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(info.error || `Falha ao buscar nota (${res.status})`);
+  const cert = openSealedCertificate(info.sealedCertificate, info.company.id);
+  const pdf = await getWithCert(`${ADN_BASE}/danfse/${info.accessKey}`, cert.pfx, cert.password);
+  if (pdf.status !== 200 || pdf.body.subarray(0, 4).toString() !== "%PDF") {
+    throw new Error(`Governo não entregou o PDF (${pdf.status}): ${pdf.body.subarray(0, 200).toString()}`);
+  }
+  const up = await fetch(`${APP_URL}/api/public/nfse/relay`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-relay-key": RELAY_KEY },
+    body: JSON.stringify({ draftId, pdfBase64: pdf.body.toString("base64") }),
+  });
+  if (!up.ok) throw new Error(`Falha ao guardar PDF (${up.status})`);
+  return { ok: true };
 }
 
 // --- HTTP ---
@@ -236,6 +281,14 @@ const server = http.createServer(async (req, res) => {
       if (!draftId) return send(400, { error: "draftId ausente" });
       const result = await emitir(draftId);
       return send(result.ok ? 200 : 502, result);
+    }
+    if (req.method === "POST" && req.url === "/danfse") {
+      if (req.headers["x-relay-key"] !== RELAY_KEY) return send(401, { error: "Não autorizado" });
+      let raw = "";
+      for await (const chunk of req) raw += chunk;
+      const { draftId } = JSON.parse(raw || "{}");
+      if (!draftId) return send(400, { error: "draftId ausente" });
+      return send(200, await baixarDanfse(draftId));
     }
     return send(404, { error: "Rota inexistente" });
   } catch (e) {
