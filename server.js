@@ -229,7 +229,7 @@ function getWithCert(urlStr, pfxBase64, password) {
   const url = new URL(urlStr);
   return new Promise((resolve, reject) => {
     const req = https.request(
-      { hostname: url.hostname, path: url.pathname, method: "GET", agent, headers: { accept: "application/pdf" }, timeout: 60000 },
+      { hostname: url.hostname, path: url.pathname, method: "GET", agent, headers: { accept: "*/*" }, timeout: 60000 },
       (res) => {
         const chunks = [];
         res.on("data", (c) => chunks.push(c));
@@ -240,6 +240,24 @@ function getWithCert(urlStr, pfxBase64, password) {
     req.on("error", reject);
     req.end();
   });
+}
+
+async function infoNota(draftId) {
+  const res = await fetch(`${APP_URL}/api/public/nfse/relay?draftId=${encodeURIComponent(draftId)}&purpose=danfse`, {
+    headers: { "x-relay-key": RELAY_KEY },
+  });
+  const info = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(info.error || `Falha ao buscar nota (${res.status})`);
+  return { info, cert: openSealedCertificate(info.sealedCertificate, info.company.id) };
+}
+
+// XML oficial da NFS-e autorizada, consultado na Sefin Nacional pela chave.
+async function baixarXml(draftId) {
+  const { info, cert } = await infoNota(draftId);
+  const r = await getWithCert(`${SEFIN_BASE}/nfse/${info.accessKey}`, cert.pfx, cert.password);
+  if (r.status !== 200) throw new Error(`Consulta da nota falhou (${r.status}): ${r.body.subarray(0, 200)}`);
+  const j = JSON.parse(r.body.toString("utf8"));
+  return zlib.gunzipSync(Buffer.from(j.nfseXmlGZipB64, "base64")).toString("utf8");
 }
 
 async function baixarDanfse(draftId) {
@@ -291,6 +309,13 @@ const server = http.createServer(async (req, res) => {
       if (!draftId) return send(400, { error: "draftId ausente" });
       const result = await emitir(draftId);
       return send(result.ok ? 200 : 502, result);
+    }
+    if (req.method === "POST" && req.url === "/xml") {
+      if (req.headers["x-relay-key"] !== RELAY_KEY) return send(401, { error: "Não autorizado" });
+      let raw = "";
+      for await (const chunk of req) raw += chunk;
+      const { draftId } = JSON.parse(raw || "{}");
+      return send(200, { xml: await baixarXml(draftId) });
     }
     if (req.method === "POST" && req.url === "/danfse") {
       if (req.headers["x-relay-key"] !== RELAY_KEY) return send(401, { error: "Não autorizado" });
