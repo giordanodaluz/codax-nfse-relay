@@ -260,27 +260,68 @@ async function baixarXml(draftId) {
   return zlib.gunzipSync(Buffer.from(j.nfseXmlGZipB64, "base64")).toString("utf8");
 }
 
-async function baixarDanfse(draftId) {
-  const res = await fetch(`${APP_URL}/api/public/nfse/relay?draftId=${encodeURIComponent(draftId)}&purpose=danfse`, {
-    headers: { "x-relay-key": RELAY_KEY },
+// --- DANFSe gerado pela CODAX a partir do XML oficial (a API do governo foi suspensa pela NT 008) ---
+function gerarDanfsePdf(xml) {
+  const PDFDocument = require("pdfkit");
+  const doc0 = new DOMParser().parseFromString(xml, "text/xml");
+  const first = (root, tag) => { const n = root.getElementsByTagName(tag); return n.length ? n[0].textContent : ""; };
+  const inf = doc0.getElementsByTagName("infNFSe")[0];
+  const emit = doc0.getElementsByTagName("emit")[0];
+  const toma = doc0.getElementsByTagName("toma")[0];
+  const chave = (inf.getAttribute("Id") || "").replace(/^NFS/, "");
+  const fmtDoc = (d) => d.length === 14 ? d.replace(/(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})/, "$1.$2.$3/$4-$5")
+    : d.replace(/(\d{3})(\d{3})(\d{3})(\d{2})/, "$1.$2.$3-$4");
+  const brl = (v) => "R$ " + Number(v || 0).toFixed(2).replace(".", ",");
+  const dt = (v) => v ? v.slice(8, 10) + "/" + v.slice(5, 7) + "/" + v.slice(0, 4) + (v.length > 10 ? " " + v.slice(11, 16) : "") : "";
+  const end = emit.getElementsByTagName("enderNac")[0];
+  const endereco = end ? `${first(end, "xLgr")}, ${first(end, "nro")} - ${first(end, "xBairro")} - ${first(inf, "xLocEmi")}/${first(end, "UF")} - CEP ${first(end, "CEP")}` : "";
+  return new Promise((resolve) => {
+    const doc = new PDFDocument({ size: "A4", margin: 40 });
+    const chunks = [];
+    doc.on("data", (c) => chunks.push(c));
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    const W = 515;
+    const box = (title, rows) => {
+      const y = doc.y;
+      doc.fontSize(8).font("Helvetica-Bold").fillColor("#333").text(title.toUpperCase(), 46, y + 6);
+      doc.font("Helvetica").fontSize(9).fillColor("#000");
+      rows.forEach(([k, v]) => { doc.font("Helvetica-Bold").text(k + ": ", 46, doc.y + 2, { continued: true, width: W - 12 }).font("Helvetica").text(v || "-"); });
+      const h = doc.y - y + 6;
+      doc.rect(40, y, W, h).stroke("#999");
+      doc.y = y + h + 6;
+    };
+    doc.font("Helvetica-Bold").fontSize(14).text("DANFSe - Documento Auxiliar da NFS-e", { align: "center" });
+    doc.font("Helvetica").fontSize(9).text("Nota Fiscal de Serviço Eletrônica - Padrão Nacional", { align: "center" }).moveDown(0.8);
+    box("Identificação", [
+      ["Número da NFS-e", first(inf, "nNFSe")], ["Competência", dt(first(inf, "dCompet"))],
+      ["Emissão da DPS", dt(first(inf, "dhEmi"))], ["Autorização", dt(first(inf, "dhProc"))],
+      ["Série / Nº DPS", `${first(inf, "serie")} / ${first(inf, "nDPS")}`], ["Chave de acesso", chave],
+    ]);
+    box("Prestador", [
+      ["Razão social", first(emit, "xNome")], ["CNPJ", fmtDoc(first(emit, "CNPJ"))],
+      ["Endereço", endereco], ["E-mail", first(emit, "email")], ["Telefone", first(emit, "fone")],
+    ]);
+    box("Tomador", [
+      ["Nome", toma ? first(toma, "xNome") : ""], ["CPF/CNPJ", toma ? fmtDoc(first(toma, "CPF") || first(toma, "CNPJ")) : ""],
+    ]);
+    box("Serviço", [
+      ["Código de tributação nacional", `${first(inf, "cTribNac")} - ${first(inf, "xTribNac")}`],
+      ["Local da prestação", first(inf, "xLocPrestacao")], ["Município de incidência", first(inf, "xLocIncid")],
+      ["Descrição", first(inf, "xDescServ")],
+    ]);
+    box("Valores", [
+      ["Valor do serviço", brl(first(inf, "vServ"))], ["Valor líquido", brl(first(inf, "vLiq"))],
+      ["Tributos aproximados (Simples Nacional)", first(inf, "pTotTribSN") ? first(inf, "pTotTribSN") + "%" : "-"],
+    ]);
+    doc.moveDown(0.5).fontSize(8).fillColor("#333").text(
+      "Consulte a autenticidade em https://www.nfse.gov.br/ConsultaPublica informando a chave de acesso acima.", { align: "center" });
+    doc.end();
   });
-  const info = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(info.error || `Falha ao buscar nota (${res.status})`);
-  const cert = openSealedCertificate(info.sealedCertificate, info.company.id);
-  const candidates = [
-    `${ADN_BASE}/danfse/${info.accessKey}`,
-    `${ADN_BASE}/contribuintes/danfse/${info.accessKey}`,
-    `${SEFIN_BASE}/danfse/${info.accessKey}`,
-    `${SEFIN_BASE}/nfse/${info.accessKey}/danfse`,
-  ];
-  let pdf = null;
-  const tries = [];
-  for (const u of candidates) {
-    const r = await getWithCert(u, cert.pfx, cert.password).catch((e) => ({ status: 0, body: Buffer.from(e.message) }));
-    tries.push(`${u} -> ${r.status}`);
-    if (r.status === 200 && r.body.subarray(0, 4).toString() === "%PDF") { pdf = r; break; }
-  }
-  if (!pdf) throw new Error(`Governo não entregou o PDF: ${tries.join(" | ")}`);
+}
+
+async function baixarDanfse(draftId) {
+  const xml = await baixarXml(draftId);
+  const pdf = { body: await gerarDanfsePdf(xml) };
   const up = await fetch(`${APP_URL}/api/public/nfse/relay`, {
     method: "POST",
     headers: { "content-type": "application/json", "x-relay-key": RELAY_KEY },
