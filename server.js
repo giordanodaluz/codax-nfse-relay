@@ -71,24 +71,42 @@ async function reportResult(draftId, result) {
 // --- Monta a DPS (Declaração de Prestação de Serviços) no padrão nacional ---
 function buildDpsXml(draft, company) {
   const cnpj = String(company.cnpj || "").replace(/\D/g, "");
-  const now = new Date().toISOString();
+  const cMun = String(draft.municipality_ibge || company.municipality_ibge || "").replace(/\D/g, "");
+  // Horário de Brasília, sem milissegundos, 1 minuto no passado (o governo recusa data futura).
+  const br = new Date(Date.now() - 60000 - 3 * 3600000).toISOString().slice(0, 19);
+  const dhEmi = `${br}-03:00`;
+  const serie = "1";
+  const nDPS = String(Math.floor(Date.now() / 1000));
+  const id = `DPS${cMun}2${cnpj}${serie.padStart(5, "0")}${nDPS.padStart(15, "0")}`;
   const valor = Number(draft.amount).toFixed(2);
   const docTomador = String(draft.client_doc || "").replace(/\D/g, "");
   const tomadorTag = docTomador.length === 14 ? "CNPJ" : "CPF";
+  const lc = String(draft.lc116_service_code || "").replace(/\D/g, "").padStart(4, "0");
+  const cTribNac = lc.length >= 6 ? lc.slice(0, 6) : `${lc}01`;
+  const opSimpNac = process.env.NFSE_OP_SIMPLES || "3"; // 1 não optante, 2 MEI, 3 ME/EPP
+  const regTrib = `<regTrib><opSimpNac>${opSimpNac}</opSimpNac>` +
+    (opSimpNac === "3" ? `<regApTribSN>1</regApTribSN>` : "") +
+    `<regEspTrib>0</regEspTrib></regTrib>`;
   return (
     `<DPS xmlns="http://www.sped.fazenda.gov.br/nfse" versao="1.00">` +
-    `<infDPS Id="dps${draft.id.replace(/-/g, "")}">` +
+    `<infDPS Id="${id}">` +
     `<tpAmb>${AMBIENTE === "producao" ? "1" : "2"}</tpAmb>` +
-    `<dhEmi>${now}</dhEmi>` +
-    `<dCompet>${now.slice(0, 10)}</dCompet>` +
+    `<dhEmi>${dhEmi}</dhEmi>` +
+    `<verAplic>CODAX1.0</verAplic>` +
+    `<serie>${serie}</serie>` +
+    `<nDPS>${nDPS}</nDPS>` +
+    `<dCompet>${br.slice(0, 10)}</dCompet>` +
+    `<tpEmit>1</tpEmit>` +
+    `<cLocEmi>${cMun}</cLocEmi>` +
     `<prest><CNPJ>${cnpj}</CNPJ>` +
-    (company.municipal_registration ? `<IM>${company.municipal_registration}</IM>` : "") +
-    `</prest>` +
+    (process.env.NFSE_SEND_IM === "1" && company.municipal_registration ? `<IM>${company.municipal_registration}</IM>` : "") +
+    regTrib + `</prest>` +
     `<toma><${tomadorTag}>${docTomador}</${tomadorTag}><xNome>${escapeXml(draft.client_name)}</xNome></toma>` +
-    `<serv><cTribNac>${String(draft.lc116_service_code || "").replace(/\D/g, "")}</cTribNac>` +
-    `<xDescServ>${escapeXml(draft.description)}</xDescServ>` +
-    `<cMunIncid>${draft.municipality_ibge}</cMunIncid></serv>` +
-    `<valores><vServ>${valor}</vServ></valores>` +
+    `<serv><locPrest><cLocPrestacao>${cMun}</cLocPrestacao></locPrest>` +
+    `<cServ><cTribNac>${cTribNac}</cTribNac><xDescServ>${escapeXml(draft.description)}</xDescServ></cServ></serv>` +
+    `<valores><vServPrest><vServ>${valor}</vServ></vServPrest>` +
+    `<trib><tribMun><tribISSQN>1</tribISSQN><tpRetISSQN>1</tpRetISSQN></tribMun>` +
+    `<totTrib><indTotTrib>0</indTotTrib></totTrib></trib></valores>` +
     `</infDPS></DPS>`
   );
 }
@@ -127,12 +145,12 @@ function signDps(xml, pfxBase64, password) {
       "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
     ],
     digestAlgorithm: "http://www.w3.org/2001/04/xmlenc#sha256",
-    uri: `#dps${xml.match(/Id="(dps[^"]+)"/)[1].slice(3)}`,
+    uri: `#${xml.match(/Id="([^"]+)"/)[1]}`,
   });
   sig.computeSignature(xml, {
     location: { reference: "//*[local-name(.)='DPS']", action: "append" },
   });
-  return sig.getSignedXml();
+  return `<?xml version="1.0" encoding="UTF-8"?>${sig.getSignedXml()}`;
 }
 
 // --- Envia à Sefin Nacional com conexão autenticada pelo certificado (mTLS) ---
