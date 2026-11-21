@@ -249,10 +249,20 @@ async function baixarDanfse(draftId) {
   const info = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(info.error || `Falha ao buscar nota (${res.status})`);
   const cert = openSealedCertificate(info.sealedCertificate, info.company.id);
-  const pdf = await getWithCert(`${ADN_BASE}/danfse/${info.accessKey}`, cert.pfx, cert.password);
-  if (pdf.status !== 200 || pdf.body.subarray(0, 4).toString() !== "%PDF") {
-    throw new Error(`Governo não entregou o PDF (${pdf.status}): ${pdf.body.subarray(0, 200).toString()}`);
+  const candidates = [
+    `${ADN_BASE}/danfse/${info.accessKey}`,
+    `${ADN_BASE}/contribuintes/danfse/${info.accessKey}`,
+    `${SEFIN_BASE}/danfse/${info.accessKey}`,
+    `${SEFIN_BASE}/nfse/${info.accessKey}/danfse`,
+  ];
+  let pdf = null;
+  const tries = [];
+  for (const u of candidates) {
+    const r = await getWithCert(u, cert.pfx, cert.password).catch((e) => ({ status: 0, body: Buffer.from(e.message) }));
+    tries.push(`${u} -> ${r.status}`);
+    if (r.status === 200 && r.body.subarray(0, 4).toString() === "%PDF") { pdf = r; break; }
   }
+  if (!pdf) throw new Error(`Governo não entregou o PDF: ${tries.join(" | ")}`);
   const up = await fetch(`${APP_URL}/api/public/nfse/relay`, {
     method: "POST",
     headers: { "content-type": "application/json", "x-relay-key": RELAY_KEY },
