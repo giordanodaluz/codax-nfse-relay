@@ -22,11 +22,11 @@ const RELAY_KEY = process.env.CODAX_RELAY_KEY || "";
 const CERT_KEY = process.env.CODAX_CERTIFICATE_ENCRYPTION_KEY || "";
 const AMBIENTE = process.env.NFSE_AMBIENTE === "producao" ? "producao" : "homologacao";
 
-// Endpoints do Ambiente de Dados Nacional (ADN) da NFS-e.
+// Endpoints da Sefin Nacional NFS-e (recepção síncrona da DPS).
 // Homologação = "produção restrita": emite notas de teste sem valor fiscal.
-const ADN_BASE = {
-  homologacao: "https://adn.producaorestrita.nfse.gov.br",
-  producao: "https://adn.nfse.gov.br",
+const SEFIN_BASE = {
+  homologacao: "https://sefin.producaorestrita.nfse.gov.br/SefinNacional",
+  producao: "https://sefin.nfse.gov.br/SefinNacional",
 }[AMBIENTE];
 
 function assertConfig() {
@@ -116,7 +116,7 @@ function signDps(xml, pfxBase64, password) {
 
   const sig = new SignedXml({
     privateKey: keyPem,
-    signatureAlgorithm: "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
+    signatureAlgorithm: "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
     canonicalizationAlgorithm: "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
     getCertFromKeyInfo: () => certDerB64,
   });
@@ -126,7 +126,7 @@ function signDps(xml, pfxBase64, password) {
       "http://www.w3.org/2000/09/xmldsig#enveloped-signature",
       "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
     ],
-    digestAlgorithm: "http://www.w3.org/2000/09/xmldsig#sha1",
+    digestAlgorithm: "http://www.w3.org/2001/04/xmlenc#sha256",
     uri: `#dps${xml.match(/Id="(dps[^"]+)"/)[1].slice(3)}`,
   });
   sig.computeSignature(xml, {
@@ -135,8 +135,8 @@ function signDps(xml, pfxBase64, password) {
   return sig.getSignedXml();
 }
 
-// --- Envia ao ADN com conexão autenticada pelo certificado (mTLS) ---
-function transmitToAdn(signedXml, pfxBase64, password) {
+// --- Envia à Sefin Nacional com conexão autenticada pelo certificado (mTLS) ---
+function transmitToSefin(signedXml, pfxBase64, password) {
   const gzipB64 = zlib.gzipSync(Buffer.from(signedXml, "utf8")).toString("base64");
   const agent = new https.Agent({
     pfx: Buffer.from(pfxBase64, "base64"),
@@ -144,7 +144,7 @@ function transmitToAdn(signedXml, pfxBase64, password) {
     rejectUnauthorized: true,
   });
   const body = JSON.stringify({ dpsXmlGZipB64: gzipB64 });
-  const url = new URL(`${ADN_BASE}/nfse`);
+  const url = new URL(`${SEFIN_BASE}/nfse`);
   return new Promise((resolve, reject) => {
     const req = https.request(
       {
@@ -179,17 +179,20 @@ async function emitir(draftId) {
   const cert = openSealedCertificate(sealedCertificate, company.id);
   const dps = buildDpsXml(draft, company);
   const signed = signDps(dps, cert.pfx, cert.password);
-  const res = await transmitToAdn(signed, cert.pfx, cert.password);
+  const res = await transmitToSefin(signed, cert.pfx, cert.password);
   if (res.status >= 200 && res.status < 300) {
-    let parsed = {};
-    try { parsed = JSON.parse(res.body); } catch { /* resposta pode ser XML */ }
-    const number = parsed.nNFSe || extractAuthorizedNumber(res.body);
+    const parsed = JSON.parse(res.body);
+    // A Sefin devolve a NFS-e autorizada compactada (gzip + base64).
+    const nfseXml = parsed.nfseXmlGZipB64
+      ? zlib.gunzipSync(Buffer.from(parsed.nfseXmlGZipB64, "base64")).toString("utf8")
+      : "";
+    const number = extractAuthorizedNumber(nfseXml) || parsed.nNFSe || null;
     await reportResult(draftId, {
       status: "authorized",
       number,
-      accessKey: parsed.chaveAcesso || parsed.idDps || "",
+      accessKey: parsed.chaveAcesso || "",
     });
-    return { ok: true, number };
+    return { ok: true, number, chaveAcesso: parsed.chaveAcesso || null };
   }
   await reportResult(draftId, { status: "rejected", message: res.body.slice(0, 500) });
   return { ok: false, status: res.status, body: res.body.slice(0, 500) };
@@ -204,7 +207,7 @@ const server = http.createServer(async (req, res) => {
   try {
     assertConfig();
     if (req.method === "GET" && req.url === "/saude") {
-      return send(200, { ok: true, ambiente: AMBIENTE, adn: ADN_BASE });
+      return send(200, { ok: true, ambiente: AMBIENTE, sefin: SEFIN_BASE });
     }
     if (req.method === "POST" && req.url === "/emitir") {
       if (req.headers["x-relay-key"] !== RELAY_KEY) return send(401, { error: "Não autorizado" });
