@@ -136,7 +136,8 @@ function signDps(xml, pfxBase64, password) {
     privateKey: keyPem,
     signatureAlgorithm: "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
     canonicalizationAlgorithm: "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
-    getCertFromKeyInfo: () => certDerB64,
+    publicCert: certPem,
+    getKeyInfoContent: () => `<X509Data><X509Certificate>${certDerB64}</X509Certificate></X509Data>`,
   });
   sig.addReference({
     xpath: "//*[local-name(.)='infDPS']",
