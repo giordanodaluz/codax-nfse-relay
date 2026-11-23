@@ -332,6 +332,20 @@ async function baixarDanfse(draftId) {
 }
 
 // --- HTTP ---
+// Consulta na Sefin Nacional se há evento de cancelamento (101101) ou cancelamento por substituição (105102).
+async function consultarSituacao(draftId) {
+  const { info, cert } = await infoNota(draftId);
+  for (const tipo of ["101101", "105102"]) {
+    const r = await getWithCert(`${SEFIN_BASE}/nfse/${info.accessKey}/eventos/${tipo}/1`, cert.pfx, cert.password);
+    if (r.status === 200) {
+      await reportResult(draftId, { status: "cancelled", accessKey: info.accessKey });
+      return { situacao: "cancelada", evento: tipo };
+    }
+    if (r.status !== 404) throw new Error(`Consulta de eventos falhou (${r.status}): ${r.body.subarray(0, 200)}`);
+  }
+  return { situacao: "valida" };
+}
+
 const server = http.createServer(async (req, res) => {
   const send = (code, obj) => {
     res.writeHead(code, { "content-type": "application/json" });
@@ -357,6 +371,14 @@ const server = http.createServer(async (req, res) => {
       for await (const chunk of req) raw += chunk;
       const { draftId } = JSON.parse(raw || "{}");
       return send(200, { xml: await baixarXml(draftId) });
+    }
+    if (req.method === "POST" && req.url === "/situacao") {
+      if (req.headers["x-relay-key"] !== RELAY_KEY) return send(401, { error: "Não autorizado" });
+      let raw = "";
+      for await (const chunk of req) raw += chunk;
+      const { draftId } = JSON.parse(raw || "{}");
+      if (!draftId) return send(400, { error: "draftId ausente" });
+      return send(200, await consultarSituacao(draftId));
     }
     if (req.method === "POST" && req.url === "/danfse") {
       if (req.headers["x-relay-key"] !== RELAY_KEY) return send(401, { error: "Não autorizado" });
