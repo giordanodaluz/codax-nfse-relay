@@ -106,7 +106,7 @@ function buildDpsXml(draft, company) {
     `<cServ><cTribNac>${cTribNac}</cTribNac><xDescServ>${escapeXml(draft.description)}</xDescServ></cServ></serv>` +
     `<valores><vServPrest><vServ>${valor}</vServ></vServPrest>` +
     `<trib><tribMun><tribISSQN>1</tribISSQN><tpRetISSQN>1</tpRetISSQN></tribMun>` +
-    `<totTrib>${opSimpNac === "3" ? `<pTotTribSN>${process.env.NFSE_ALIQ_SN || "6.00"}</pTotTribSN>` : `<indTotTrib>0</indTotTrib>`}</totTrib></trib></valores>` +
+    `<totTrib>${opSimpNac === "3" ? `<pTotTribSN>${draft.sn_rate != null ? Number(draft.sn_rate).toFixed(2) : (process.env.NFSE_ALIQ_SN || "6.00")}</pTotTribSN>` : `<indTotTrib>0</indTotTrib>`}</totTrib></trib></valores>` +
     `</infDPS></DPS>`
   );
 }
