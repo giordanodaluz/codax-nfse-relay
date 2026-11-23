@@ -406,7 +406,7 @@ async function serproCall(ctx, rota, contribuinte, idSistema, idServico, dados) 
   return { status: r.status, body: j };
 }
 
-async function serpro(op, contribuinte, periodo) {
+async function serpro(op, contribuinte, periodo, dados) {
   const ctx = await serproContext();
   if (op === "procuracao") {
     const doc = String(contribuinte).replace(/\D/g, "");
@@ -428,6 +428,13 @@ async function serpro(op, contribuinte, periodo) {
       total: det?.valores?.total ?? null, vencimento: det?.dataVencimento || det?.dataLimiteAcolhimento || null,
       mensagens: r.body.mensagens || [],
     };
+  }
+  if (op === "pgdas") {
+    // Declaração mensal (TRANSDECLARACAO11); indicadorTransmissao=false só calcula.
+    const r = await serproCall(ctx, "Declarar", contribuinte, "PGDASD", "TRANSDECLARACAO11", dados);
+    let out = null;
+    try { out = JSON.parse(r.body.dados || "null"); } catch {}
+    return { ok: r.status === 200, status: r.status, dados: out, mensagens: r.body.mensagens || [] };
   }
   throw new Error("Operação inválida");
 }
@@ -478,10 +485,11 @@ const server = http.createServer(async (req, res) => {
       if (req.headers["x-relay-key"] !== RELAY_KEY) return send(401, { error: "Não autorizado" });
       let raw = "";
       for await (const chunk of req) raw += chunk;
-      const { op, contribuinte, periodo } = JSON.parse(raw || "{}");
+      const { op, contribuinte, periodo, dados } = JSON.parse(raw || "{}");
       if (!contribuinte) return send(400, { error: "contribuinte ausente" });
       if (op === "das" && !/^\d{6}$/.test(String(periodo))) return send(400, { error: "periodo AAAAMM" });
-      return send(200, await serpro(op, contribuinte, periodo));
+      if (op === "pgdas" && (!dados || typeof dados !== "object")) return send(400, { error: "dados ausentes" });
+      return send(200, await serpro(op, contribuinte, periodo, dados));
     }
     return send(404, { error: "Rota inexistente" });
   } catch (e) {
