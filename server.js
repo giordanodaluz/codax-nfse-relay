@@ -465,7 +465,7 @@ function soap(action, inner) {
 const tag = (xml, name) => { const m = xml.match(new RegExp(`<(?:\\w+:)?${name}[^>]*>([\\s\\S]*?)</(?:\\w+:)?${name}>`)); return m ? m[1] : null; };
 
 // eSocial (IIS) pede o certificado por renegociação TLS 1.2 e exige a cadeia completa.
-function esocialRequest(urlStr, headers, body, cert) {
+function esocialRequest(urlStr, headers, body, cert, method = "POST") {
   const p12 = forge.pkcs12.pkcs12FromAsn1(forge.asn1.fromDer(forge.util.decode64(cert.pfx)), cert.password);
   const key = Object.values(p12.getBags({ bagType: forge.pki.oids.pkcs8ShroudedKeyBag })).flat().find((b) => b && b.key)?.key;
   const certs = Object.values(p12.getBags({ bagType: forge.pki.oids.certBag })).flat().filter((b) => b && b.cert).map((b) => b.cert);
@@ -474,7 +474,7 @@ function esocialRequest(urlStr, headers, body, cert) {
   const agent = new https.Agent({ key: forge.pki.privateKeyToPem(key), cert: chain, maxVersion: "TLSv1.2", keepAlive: false });
   const url = new URL(urlStr);
   return new Promise((resolve, reject) => {
-    const req = https.request({ hostname: url.hostname, path: url.pathname, method: "POST", agent, headers: { ...headers, "content-length": Buffer.byteLength(body) }, timeout: 90000 }, (res) => {
+    const req = https.request({ hostname: url.hostname, path: url.pathname + url.search, method, agent, headers: { ...headers, "content-length": Buffer.byteLength(body) }, timeout: 90000 }, (res) => {
       const chunks = []; res.on("data", (c) => chunks.push(c));
       res.on("end", () => resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString("utf8") }));
     });
@@ -485,6 +485,16 @@ function esocialRequest(urlStr, headers, body, cert) {
 async function esocial(op, empregador, eventos, protocolo) {
   const ctx = await serproContext();
   const office = String(ctx.officeCnpj).replace(/\D/g, "");
+  if (op === "diag") {
+    const out = {};
+    for (const [n, u] of Object.entries({ envio: `${ESOCIAL_HOST}/servicos/empregador/enviarloteeventos/WsEnviarLoteEventos.svc?singleWsdl`, consulta: `${ESOCIAL_HOST}/servicos/empregador/consultarloteeventos/WsConsultarLoteEventos.svc?singleWsdl` })) {
+      const r = await esocialRequest(u, {}, "", ctx.cert, "GET").catch((e) => ({ status: 0, text: e.message }));
+      out[n] = { status: r.status, head: r.text.slice(0, 200) };
+    }
+    const ip = await fetch("https://ipinfo.io/json").then((r) => r.json()).catch(() => ({}));
+    out.origem = ip.country;
+    return out;
+  }
   if (op === "enviar") {
     const ev = eventos.map((e) => `<evento Id="${e.id}">${signEsocialEvent(e.xml, ctx.cert)}</evento>`).join("");
     const body = soap("", `<v1:EnviarLoteEventos xmlns:v1="http://www.esocial.gov.br/servicos/empregador/lote/eventos/envio/v1_1_0"><v1:loteEventos><eSocial xmlns="http://www.esocial.gov.br/schema/lote/eventos/envio/v1_1_1"><envioLoteEventos grupo="${eventos[0].grupo || 1}"><ideEmpregador><tpInsc>1</tpInsc><nrInsc>${empregador.slice(0, 8)}</nrInsc></ideEmpregador><ideTransmissor><tpInsc>1</tpInsc><nrInsc>${office}</nrInsc></ideTransmissor><eventos>${ev}</eventos></envioLoteEventos></eSocial></v1:loteEventos></v1:EnviarLoteEventos>`);
