@@ -346,6 +346,92 @@ async function consultarSituacao(draftId) {
   return { situacao: "valida" };
 }
 
+// --- Integra Contador (Serpro): procurações e DAS do Simples Nacional ---
+// O contratante é o escritório (G L Negócios); a autenticação usa o e-CNPJ dele (mTLS).
+const SERPRO_AUTH = "https://autenticacao.sapi.serpro.gov.br/authenticate";
+const SERPRO_API = "https://gateway.apiserpro.serpro.gov.br/integra-contador/v1";
+let serproToken = null; // { access, jwt, until }
+
+function requestWithCert(urlStr, { method = "POST", headers = {}, body = "" }, pfxBase64, password) {
+  const agent = new https.Agent({ pfx: Buffer.from(pfxBase64, "base64"), passphrase: password });
+  const url = new URL(urlStr);
+  return new Promise((resolve, reject) => {
+    const req = https.request({ hostname: url.hostname, path: url.pathname + url.search, method, agent, headers: { ...headers, "content-length": Buffer.byteLength(body) }, timeout: 60000 }, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString("utf8") }));
+    });
+    req.on("timeout", () => req.destroy(new Error("Tempo esgotado no Serpro.")));
+    req.on("error", reject);
+    req.end(body);
+  });
+}
+
+async function serproContext() {
+  const res = await fetch(`${APP_URL}/api/public/nfse/relay?purpose=serpro`, { headers: { "x-relay-key": RELAY_KEY } });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `Falha ao buscar credenciais (${res.status})`);
+  const cert = openSealedCertificate(body.sealedCertificate, body.officeCompanyId);
+  return { ...body, cert };
+}
+
+async function serproAuth(ctx) {
+  if (serproToken && serproToken.until > Date.now() + 60000) return serproToken;
+  const basic = Buffer.from(`${ctx.consumerKey}:${ctx.consumerSecret}`).toString("base64");
+  const r = await requestWithCert(SERPRO_AUTH, {
+    headers: { authorization: `Basic ${basic}`, "role-type": "TERCEIROS", "content-type": "application/x-www-form-urlencoded" },
+    body: "grant_type=client_credentials",
+  }, ctx.cert.pfx, ctx.cert.password);
+  if (r.status !== 200) throw new Error(`Serpro recusou a autenticação [${r.status}]: ${r.text.slice(0, 300)}`);
+  const j = JSON.parse(r.text);
+  serproToken = { access: j.access_token, jwt: j.jwt_token, until: Date.now() + Number(j.expires_in || 2000) * 1000 };
+  return serproToken;
+}
+
+async function serproCall(ctx, rota, contribuinte, idSistema, idServico, dados) {
+  const tok = await serproAuth(ctx);
+  const office = { numero: ctx.officeCnpj, tipo: 2 };
+  const doc = String(contribuinte).replace(/\D/g, "");
+  const payload = {
+    contratante: office, autorPedidoDados: office,
+    contribuinte: { numero: doc, tipo: doc.length === 11 ? 1 : 2 },
+    pedidoDados: { idSistema, idServico, versaoSistema: "1.0", dados: JSON.stringify(dados) },
+  };
+  const r = await requestWithCert(`${SERPRO_API}/${rota}`, {
+    headers: { authorization: `Bearer ${tok.access}`, jwt_token: tok.jwt, "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify(payload),
+  }, ctx.cert.pfx, ctx.cert.password);
+  let j = {};
+  try { j = JSON.parse(r.text); } catch { j = { raw: r.text.slice(0, 500) }; }
+  return { status: r.status, body: j };
+}
+
+async function serpro(op, contribuinte, periodo) {
+  const ctx = await serproContext();
+  if (op === "procuracao") {
+    const doc = String(contribuinte).replace(/\D/g, "");
+    const r = await serproCall(ctx, "Consultar", contribuinte, "PROCURACOES", "OBTERPROCURACAO41",
+      { outorgante: doc, tipoOutorgante: doc.length === 11 ? "1" : "2", outorgado: ctx.officeCnpj, tipoOutorgado: "2" });
+    let lista = [];
+    try { lista = JSON.parse(r.body.dados || "[]"); } catch {}
+    const pgdas = (Array.isArray(lista) ? lista : []).find((p) => (p.sistemas || []).some((s) => /PGDAS/i.test(s)));
+    return { ok: r.status === 200, status: r.status, authorized: Boolean(pgdas), expira: pgdas?.dtexpiracao || null, mensagens: r.body.mensagens || [] };
+  }
+  if (op === "das") {
+    const r = await serproCall(ctx, "Emitir", contribuinte, "PGDASD", "GERARDAS12", { periodoApuracao: periodo });
+    let dados = null;
+    try { dados = JSON.parse(r.body.dados || "null"); } catch {}
+    const item = Array.isArray(dados) ? dados[0] : dados;
+    const det = item?.detalhamento?.[0] || item?.detalhamento || {};
+    return {
+      ok: r.status === 200 && Boolean(item?.pdf), status: r.status, pdf: item?.pdf || null,
+      total: det?.valores?.total ?? null, vencimento: det?.dataVencimento || det?.dataLimiteAcolhimento || null,
+      mensagens: r.body.mensagens || [],
+    };
+  }
+  throw new Error("Operação inválida");
+}
+
 const server = http.createServer(async (req, res) => {
   const send = (code, obj) => {
     res.writeHead(code, { "content-type": "application/json" });
@@ -387,6 +473,15 @@ const server = http.createServer(async (req, res) => {
       const { draftId } = JSON.parse(raw || "{}");
       if (!draftId) return send(400, { error: "draftId ausente" });
       return send(200, await baixarDanfse(draftId));
+    }
+    if (req.method === "POST" && req.url === "/serpro") {
+      if (req.headers["x-relay-key"] !== RELAY_KEY) return send(401, { error: "Não autorizado" });
+      let raw = "";
+      for await (const chunk of req) raw += chunk;
+      const { op, contribuinte, periodo } = JSON.parse(raw || "{}");
+      if (!contribuinte) return send(400, { error: "contribuinte ausente" });
+      if (op === "das" && !/^\d{6}$/.test(String(periodo))) return send(400, { error: "periodo AAAAMM" });
+      return send(200, await serpro(op, contribuinte, periodo));
     }
     return send(404, { error: "Rota inexistente" });
   } catch (e) {
