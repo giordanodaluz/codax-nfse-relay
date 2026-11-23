@@ -439,6 +439,56 @@ async function serpro(op, contribuinte, periodo, dados) {
   throw new Error("Operação inválida");
 }
 
+
+// --- eSocial (lote assíncrono, SOAP + mTLS, assinatura do escritório como procurador) ---
+const ESOCIAL_HOST = process.env.ESOCIAL_AMBIENTE === "producao" ? "https://webservices.esocial.gov.br" : "https://webservices.producaorestrita.esocial.gov.br";
+function signEsocialEvent(xml, cert) {
+  const p12 = forge.pkcs12.pkcs12FromAsn1(forge.asn1.fromDer(forge.util.decode64(cert.pfx)), cert.password);
+  const key = Object.values(p12.getBags({ bagType: forge.pki.oids.pkcs8ShroudedKeyBag })).flat().find((b) => b && b.key)?.key;
+  const crt = Object.values(p12.getBags({ bagType: forge.pki.oids.certBag })).flat().find((b) => b && b.cert)?.cert;
+  const certPem = forge.pki.certificateToPem(crt);
+  const der = certPem.replace(/-----(BEGIN|END) CERTIFICATE-----|\s/g, "");
+  const sig = new SignedXml({
+    privateKey: forge.pki.privateKeyToPem(key), publicCert: certPem,
+    signatureAlgorithm: "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+    canonicalizationAlgorithm: "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+    getKeyInfoContent: () => `<X509Data><X509Certificate>${der}</X509Certificate></X509Data>`,
+  });
+  sig.addReference({ xpath: "/*", uri: "", isEmptyUri: true, digestAlgorithm: "http://www.w3.org/2001/04/xmlenc#sha256",
+    transforms: ["http://www.w3.org/2000/09/xmldsig#enveloped-signature", "http://www.w3.org/TR/2001/REC-xml-c14n-20010315"] });
+  sig.computeSignature(xml, { location: { reference: "/*", action: "append" } });
+  return sig.getSignedXml();
+}
+function soap(action, inner) {
+  return `<?xml version="1.0" encoding="UTF-8"?><soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"><soapenv:Header/><soapenv:Body>${inner}</soapenv:Body></soapenv:Envelope>`;
+}
+const tag = (xml, name) => { const m = xml.match(new RegExp(`<(?:\\w+:)?${name}[^>]*>([\\s\\S]*?)</(?:\\w+:)?${name}>`)); return m ? m[1] : null; };
+async function esocial(op, empregador, eventos, protocolo) {
+  const ctx = await serproContext();
+  const office = String(ctx.officeCnpj).replace(/\D/g, "");
+  if (op === "enviar") {
+    const ev = eventos.map((e) => `<evento Id="${e.id}">${signEsocialEvent(e.xml, ctx.cert)}</evento>`).join("");
+    const body = soap("", `<v1:EnviarLoteEventos xmlns:v1="http://www.esocial.gov.br/servicos/empregador/lote/eventos/envio/v1_1_0"><v1:loteEventos><eSocial xmlns="http://www.esocial.gov.br/schema/lote/eventos/envio/v1_1_1"><envioLoteEventos grupo="${eventos[0].grupo || 1}"><ideEmpregador><tpInsc>1</tpInsc><nrInsc>${empregador.slice(0, 8)}</nrInsc></ideEmpregador><ideTransmissor><tpInsc>1</tpInsc><nrInsc>${office}</nrInsc></ideTransmissor><eventos>${ev}</eventos></envioLoteEventos></eSocial></v1:loteEventos></v1:EnviarLoteEventos>`);
+    const r = await requestWithCert(`${ESOCIAL_HOST}/servicos/empregador/enviarloteeventos/WsEnviarLoteEventos.svc`, {
+      headers: { "content-type": "text/xml; charset=utf-8", soapaction: "http://www.esocial.gov.br/servicos/empregador/lote/eventos/envio/v1_1_0/ServicoEnviarLoteEventos/EnviarLoteEventos" }, body,
+    }, ctx.cert.pfx, ctx.cert.password);
+    return { status: r.status, cdResposta: tag(r.text, "cdResposta"), descResposta: tag(r.text, "descResposta"), protocolo: tag(r.text, "protocoloEnvio"), raw: r.text.slice(0, 3000) };
+  }
+  if (op === "consultar") {
+    const body = soap("", `<v1:ConsultarLoteEventos xmlns:v1="http://www.esocial.gov.br/servicos/empregador/lote/eventos/envio/consulta/retornoProcessamento/v1_0_0"><v1:consulta><eSocial xmlns="http://www.esocial.gov.br/schema/lote/eventos/envio/consulta/retornoProcessamento/v1_0_0"><consultaLoteEventos><protocoloEnvio>${String(protocolo).replace(/[^\d.]/g, "")}</protocoloEnvio></consultaLoteEventos></eSocial></v1:consulta></v1:ConsultarLoteEventos>`);
+    const r = await requestWithCert(`${ESOCIAL_HOST}/servicos/empregador/consultarloteeventos/WsConsultarLoteEventos.svc`, {
+      headers: { "content-type": "text/xml; charset=utf-8", soapaction: "http://www.esocial.gov.br/servicos/empregador/lote/eventos/envio/consulta/retornoProcessamento/v1_0_0/ServicoConsultarLoteEventos/ConsultarLoteEventos" }, body,
+    }, ctx.cert.pfx, ctx.cert.password);
+    const t = r.text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"');
+    const eventosRet = [...t.matchAll(/<evento Id="([^"]+)"[\s\S]*?<\/evento>/g)].map((m) => ({
+      id: m[1], cdResposta: tag(m[0], "cdResposta"), descResposta: tag(m[0], "descResposta"), recibo: tag(m[0], "nrRecibo"),
+      ocorrencias: [...m[0].matchAll(/<ocorrencia>([\s\S]*?)<\/ocorrencia>/g)].map((o) => `${tag(o[1], "codigo")}: ${tag(o[1], "descricao")} ${tag(o[1], "localizacao") || ""}`.trim()),
+    }));
+    return { status: r.status, cdResposta: tag(t, "cdResposta"), descResposta: tag(t, "descResposta"), eventos: eventosRet, raw: eventosRet.length ? undefined : t.slice(0, 3000) };
+  }
+  throw new Error("Operação inválida");
+}
+
 const server = http.createServer(async (req, res) => {
   const send = (code, obj) => {
     res.writeHead(code, { "content-type": "application/json" });
@@ -490,6 +540,16 @@ const server = http.createServer(async (req, res) => {
       if (op === "das" && !/^\d{6}$/.test(String(periodo))) return send(400, { error: "periodo AAAAMM" });
       if (op === "pgdas" && (!dados || typeof dados !== "object")) return send(400, { error: "dados ausentes" });
       return send(200, await serpro(op, contribuinte, periodo, dados));
+    }
+    if (req.method === "POST" && req.url === "/esocial") {
+      if (req.headers["x-relay-key"] !== RELAY_KEY) return send(401, { error: "Não autorizado" });
+      let raw = "";
+      for await (const chunk of req) raw += chunk;
+      const { op, empregador, eventos, protocolo } = JSON.parse(raw || "{}");
+      const emp = String(empregador || "").replace(/\D/g, "");
+      if (emp.length !== 14) return send(400, { error: "empregador CNPJ" });
+      if (op === "enviar" && (!Array.isArray(eventos) || !eventos.length || eventos.length > 50 || eventos.some((e) => !/^ID\d{34}$/.test(e.id) || typeof e.xml !== "string"))) return send(400, { error: "eventos inválidos" });
+      return send(200, await esocial(op, emp, eventos, protocolo));
     }
     return send(404, { error: "Rota inexistente" });
   } catch (e) {
